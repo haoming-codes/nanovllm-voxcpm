@@ -21,10 +21,13 @@ class VoxCPM2SeqPayload:
     generated_waveforms: list[np.ndarray]
     temperature: float
     cfg_value: float
+    target_text_length: int
+    retry_badcase_ratio_threshold: float
     decode_pad: np.ndarray | None = None
     max_generate_length: int | None = None
     seed: int | None = None
     seed_step: int = 0
+    is_badcase: bool = False
 
 
 class VoxCPM2Engine(LLMEngineBase):
@@ -108,13 +111,16 @@ class VoxCPM2Engine(LLMEngineBase):
         else:
             seq.custom_payload.decode_pad = latents[-self.n_decode_pad_frames :]
 
-        if stop_flag == 1:
-            seq.stoped = True
-        elif (
+        reached_model_stop = stop_flag == 1
+        reached_max_generate_length = (
             seq.custom_payload.max_generate_length is not None
             and len(seq.custom_payload.generated_waveforms) >= seq.custom_payload.max_generate_length
-        ):
+        )
+        if reached_model_stop or reached_max_generate_length:
             seq.stoped = True
+            seq.custom_payload.is_badcase = len(seq.custom_payload.generated_waveforms) >= (
+                seq.custom_payload.target_text_length * seq.custom_payload.retry_badcase_ratio_threshold
+            )
 
     def add_request(
         self,
@@ -128,10 +134,18 @@ class VoxCPM2Engine(LLMEngineBase):
         cfg_value: float = 1.0,
         lora_name: str | None = None,
         seed: int | None = None,
+        retry_badcase_ratio_threshold: float = 6.0,
     ):
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
+        if retry_badcase_ratio_threshold <= 0:
+            raise ValueError("retry_badcase_ratio_threshold must be > 0, " f"got {retry_badcase_ratio_threshold}")
 
+        target_text_length = len(self.tokenizer(target_text))
+        max_generate_length = min(
+            int(target_text_length * retry_badcase_ratio_threshold + 10),
+            max_generate_length,
+        )
         text_tokens = self.tokenizer(prompt_text + target_text) + [self.audio_start_token]
         audio_feat = np.zeros((len(text_tokens), self.patch_size, self.feat_dim), dtype=np.float32)
         feat_masks = [False for _ in range(len(text_tokens))]
@@ -196,6 +210,8 @@ class VoxCPM2Engine(LLMEngineBase):
                 decode_pad=decode_pad,
                 temperature=temperature,
                 cfg_value=cfg_value,
+                target_text_length=target_text_length,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
                 max_generate_length=max_generate_length,
                 generated_waveforms=[],
                 seed=seed,

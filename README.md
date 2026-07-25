@@ -146,6 +146,39 @@ wav = np.concatenate(chunks, axis=0)
 server.stop()
 ```
 
+### Buffered VoxCPM2 generation with bad-case retries
+
+VoxCPM2 applies the OpenBMB text-relative generation limit to both streaming
+and buffered requests:
+
+```text
+min(max_generate_length, target_text_token_count * retry_badcase_ratio_threshold + 10)
+```
+
+Use `generate_buffered()` when a caller can wait for the complete result and
+wants OpenBMB-style bad-case retries. Each bad attempt is discarded and the
+next attempt uses `seed + 1`. `retry_badcase_max_times` is the total number of
+attempts, including the first one.
+
+```python
+result = await server.generate_buffered(
+    target_text="Hello world",
+    seed=123,
+    retry_badcase_max_times=3,
+    retry_badcase_ratio_threshold=6.0,
+)
+
+if result.failure_reason is not None:
+    raise RuntimeError(result.failure_reason)
+
+wav = np.concatenate(result.waveforms, axis=0)
+print(result.seed, result.attempt_count, result.generated_steps)
+```
+
+If every attempt exceeds the audio-to-text ratio threshold, the result has no
+waveforms and `failure_reason="badcase_retry_exhausted"`. The synchronous
+VoxCPM2 server pool exposes the same method without `await`.
+
 ### Prompting and reference audio (optional)
 
 The VoxCPM2 server supports these conditioning inputs:

@@ -6,6 +6,7 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from queue import Empty
 from typing import Any, AsyncGenerator, List, Optional, cast
 
@@ -20,8 +21,27 @@ from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
+from nanovllm_voxcpm.utils.seed import materialize_generation_seed
 
 Waveform = NDArray[np.float32]
+
+
+@dataclass(frozen=True)
+class _GenerationAttemptResult:
+    seed: int | None
+    generated_steps: int
+    is_badcase: bool
+
+
+@dataclass(frozen=True)
+class VoxCPM2GenerationResult:
+    """Buffered audio and the minimal outcome of a VoxCPM2 retry loop."""
+
+    waveforms: tuple[Waveform, ...]
+    seed: int
+    attempt_count: int
+    generated_steps: int
+    failure_reason: Literal["badcase_retry_exhausted"] | None
 
 
 class HealthResponse(TypedDict):
@@ -125,6 +145,7 @@ class VoxCPM2ServerImpl:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        retry_badcase_ratio_threshold: float = 6.0,
     ) -> None:
 
         if prompt_latents is None:
@@ -144,6 +165,7 @@ class VoxCPM2ServerImpl:
                 cfg_value=cfg_value,
                 lora_name=lora_name,
                 seed=seed,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
             )
             return
 
@@ -166,6 +188,7 @@ class VoxCPM2ServerImpl:
             cfg_value=cfg_value,
             lora_name=lora_name,
             seed=seed,
+            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
         )
 
     def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
@@ -255,7 +278,17 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 latest_waveform = seq.custom_payload.generated_waveforms[-1]
                 queue_out.put({"type": "stream", "id": seq.seq_id, "data": latest_waveform})
                 if seq.is_finished:
-                    queue_out.put({"type": "stream", "id": seq.seq_id, "data": None})
+                    queue_out.put(
+                        {
+                            "type": "stream",
+                            "id": seq.seq_id,
+                            "data": _GenerationAttemptResult(
+                                seed=seq.custom_payload.seed,
+                                generated_steps=len(seq.custom_payload.generated_waveforms),
+                                is_badcase=seq.custom_payload.is_badcase,
+                            ),
+                        }
+                    )
 
 
 class AsyncVoxCPM2Server:
@@ -301,7 +334,7 @@ class AsyncVoxCPM2Server:
         loop = asyncio.get_running_loop()
         self._init_fut: asyncio.Future[None] = loop.create_future()
         self.op_table: dict[str, asyncio.Future[Any]] = {}
-        self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
+        self.stream_table: dict[str, asyncio.Queue[Waveform | _GenerationAttemptResult]] = {}
         self._queue_out_async: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._queue_out_stop = threading.Event()
         self._queue_out_thread = threading.Thread(
@@ -438,7 +471,108 @@ class AsyncVoxCPM2Server:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        retry_badcase_ratio_threshold: float = 6.0,
     ) -> AsyncGenerator[Waveform, None]:
+        attempt = self._generate_attempt(
+            target_text=target_text,
+            prompt_latents=prompt_latents,
+            prompt_text=prompt_text,
+            max_generate_length=max_generate_length,
+            temperature=temperature,
+            cfg_value=cfg_value,
+            ref_audio_latents=ref_audio_latents,
+            lora_name=lora_name,
+            seed=seed,
+            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+        )
+        try:
+            async for item in attempt:
+                if isinstance(item, _GenerationAttemptResult):
+                    return
+                yield item
+        finally:
+            await attempt.aclose()
+
+    async def generate_buffered(
+        self,
+        target_text: str,
+        prompt_latents: bytes | None = None,
+        prompt_text: str = "",
+        max_generate_length: int = 2000,
+        temperature: float = 1.0,
+        cfg_value: float = 2.0,
+        ref_audio_latents: bytes | None = None,
+        lora_name: str | None = None,
+        seed: int | None = None,
+        retry_badcase_max_times: int = 3,
+        retry_badcase_ratio_threshold: float = 6.0,
+    ) -> VoxCPM2GenerationResult:
+        if retry_badcase_max_times < 1:
+            raise ValueError(f"retry_badcase_max_times must be >= 1, got {retry_badcase_max_times}")
+
+        initial_seed = materialize_generation_seed(seed)
+        last_result: _GenerationAttemptResult | None = None
+
+        for attempt_index in range(retry_badcase_max_times):
+            attempt_seed = initial_seed + attempt_index
+            waveforms: list[Waveform] = []
+            attempt_result: _GenerationAttemptResult | None = None
+            attempt = self._generate_attempt(
+                target_text=target_text,
+                prompt_latents=prompt_latents,
+                prompt_text=prompt_text,
+                max_generate_length=max_generate_length,
+                temperature=temperature,
+                cfg_value=cfg_value,
+                ref_audio_latents=ref_audio_latents,
+                lora_name=lora_name,
+                seed=attempt_seed,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+            )
+            try:
+                async for item in attempt:
+                    if isinstance(item, _GenerationAttemptResult):
+                        attempt_result = item
+                    else:
+                        waveforms.append(item)
+            finally:
+                await attempt.aclose()
+
+            if attempt_result is None:
+                raise RuntimeError("generation attempt ended without a completion result")
+            last_result = attempt_result
+            if not attempt_result.is_badcase:
+                return VoxCPM2GenerationResult(
+                    waveforms=tuple(waveforms),
+                    seed=attempt_seed,
+                    attempt_count=attempt_index + 1,
+                    generated_steps=attempt_result.generated_steps,
+                    failure_reason=None,
+                )
+
+        assert last_result is not None
+        return VoxCPM2GenerationResult(
+            waveforms=(),
+            seed=initial_seed + retry_badcase_max_times - 1,
+            attempt_count=retry_badcase_max_times,
+            generated_steps=last_result.generated_steps,
+            failure_reason="badcase_retry_exhausted",
+        )
+
+    async def _generate_attempt(
+        self,
+        *,
+        target_text: str,
+        prompt_latents: bytes | None,
+        prompt_text: str,
+        max_generate_length: int,
+        temperature: float,
+        cfg_value: float,
+        ref_audio_latents: bytes | None,
+        lora_name: str | None,
+        seed: int | None,
+        retry_badcase_ratio_threshold: float,
+    ) -> AsyncGenerator[Waveform | _GenerationAttemptResult, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
         is_normal_exit = False
@@ -455,12 +589,14 @@ class AsyncVoxCPM2Server:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                retry_badcase_ratio_threshold,
             )
             while True:
                 data = await self.stream_table[seq_id].get()
-                if data is None:
+                if isinstance(data, _GenerationAttemptResult):
                     is_normal_exit = True
-                    break
+                    yield data
+                    return
                 yield data
         finally:
             if not is_normal_exit:
@@ -562,19 +698,13 @@ class AsyncVoxCPM2ServerPool:
         visible_names = sorted(name for name in self._registered_loras if name not in self._draining_loras)
         return [LoRAInfo(name=name) for name in visible_names]
 
-    async def generate(
+    def _prepare_generation_inputs(
         self,
-        target_text: str,
-        prompt_latents: bytes | None = None,
-        prompt_text: str = "",
-        prompt_id: str | None = None,
-        max_generate_length: int = 2000,
-        temperature: float = 1.0,
-        cfg_value: float = 2.0,
-        ref_audio_latents: bytes | None = None,
-        lora_name: str | None = None,
-        seed: int | None = None,
-    ):
+        prompt_latents: bytes | None,
+        prompt_text: str,
+        prompt_id: str | None,
+        lora_name: str | None,
+    ) -> tuple[bytes | None, str]:
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:
                 raise ValueError(f"Prompt with id {prompt_id} not found")
@@ -588,6 +718,29 @@ class AsyncVoxCPM2ServerPool:
 
         if lora_name is not None and (lora_name not in self._registered_loras or lora_name in self._draining_loras):
             raise ValueError(f"LoRA '{lora_name}' is not registered")
+
+        return prompt_latents, prompt_text
+
+    async def generate(
+        self,
+        target_text: str,
+        prompt_latents: bytes | None = None,
+        prompt_text: str = "",
+        prompt_id: str | None = None,
+        max_generate_length: int = 2000,
+        temperature: float = 1.0,
+        cfg_value: float = 2.0,
+        ref_audio_latents: bytes | None = None,
+        lora_name: str | None = None,
+        seed: int | None = None,
+        retry_badcase_ratio_threshold: float = 6.0,
+    ):
+        prompt_latents, prompt_text = self._prepare_generation_inputs(
+            prompt_latents,
+            prompt_text,
+            prompt_id,
+            lora_name,
+        )
 
         min_load_server_idx = np.argmin(self.servers_load)
         self.servers_load[min_load_server_idx] += 1
@@ -603,8 +756,51 @@ class AsyncVoxCPM2ServerPool:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                retry_badcase_ratio_threshold,
             ):
                 yield data
+        finally:
+            self.servers_load[min_load_server_idx] -= 1
+
+    async def generate_buffered(
+        self,
+        target_text: str,
+        prompt_latents: bytes | None = None,
+        prompt_text: str = "",
+        prompt_id: str | None = None,
+        max_generate_length: int = 2000,
+        temperature: float = 1.0,
+        cfg_value: float = 2.0,
+        ref_audio_latents: bytes | None = None,
+        lora_name: str | None = None,
+        seed: int | None = None,
+        retry_badcase_max_times: int = 3,
+        retry_badcase_ratio_threshold: float = 6.0,
+    ) -> VoxCPM2GenerationResult:
+        prompt_latents, prompt_text = self._prepare_generation_inputs(
+            prompt_latents,
+            prompt_text,
+            prompt_id,
+            lora_name,
+        )
+
+        min_load_server_idx = np.argmin(self.servers_load)
+        self.servers_load[min_load_server_idx] += 1
+        server = self.servers[min_load_server_idx]
+        try:
+            return await server.generate_buffered(
+                target_text=target_text,
+                prompt_latents=prompt_latents,
+                prompt_text=prompt_text,
+                max_generate_length=max_generate_length,
+                temperature=temperature,
+                cfg_value=cfg_value,
+                ref_audio_latents=ref_audio_latents,
+                lora_name=lora_name,
+                seed=seed,
+                retry_badcase_max_times=retry_badcase_max_times,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+            )
         finally:
             self.servers_load[min_load_server_idx] -= 1
 
@@ -687,6 +883,7 @@ class SyncVoxCPM2ServerPool:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        retry_badcase_ratio_threshold: float = 6.0,
     ):
         assert self.loop is not None
         async_gen = self.server_pool.generate(
@@ -700,9 +897,43 @@ class SyncVoxCPM2ServerPool:
             ref_audio_latents,
             lora_name,
             seed,
+            retry_badcase_ratio_threshold,
         )
         try:
             while True:
                 yield self.loop.run_until_complete(async_gen.__anext__())
         except StopAsyncIteration:
             return
+
+    def generate_buffered(
+        self,
+        target_text: str,
+        prompt_latents: bytes | None = None,
+        prompt_text: str = "",
+        prompt_id: str | None = None,
+        max_generate_length: int = 2000,
+        temperature: float = 1.0,
+        cfg_value: float = 2.0,
+        ref_audio_latents: bytes | None = None,
+        lora_name: str | None = None,
+        seed: int | None = None,
+        retry_badcase_max_times: int = 3,
+        retry_badcase_ratio_threshold: float = 6.0,
+    ) -> VoxCPM2GenerationResult:
+        assert self.loop is not None
+        return self.loop.run_until_complete(
+            self.server_pool.generate_buffered(
+                target_text=target_text,
+                prompt_latents=prompt_latents,
+                prompt_text=prompt_text,
+                prompt_id=prompt_id,
+                max_generate_length=max_generate_length,
+                temperature=temperature,
+                cfg_value=cfg_value,
+                ref_audio_latents=ref_audio_latents,
+                lora_name=lora_name,
+                seed=seed,
+                retry_badcase_max_times=retry_badcase_max_times,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+            )
+        )
