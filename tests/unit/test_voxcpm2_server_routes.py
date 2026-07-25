@@ -26,6 +26,7 @@ class _FakeServer:
         self.registered: list[tuple[str, str]] = []
         self.unregistered: list[str] = []
         self.generate_calls: list[dict] = []
+        self.generate_buffered_calls: list[dict] = []
         self.encode_calls: list[tuple[bytes, str]] = []
 
     async def register_lora(self, name: str, path: str):
@@ -62,6 +63,7 @@ class _FakeServer:
         ref_audio_latents=None,
         lora_name=None,
         seed=42,
+        retry_badcase_ratio_threshold=6.0,
     ):
         self.generate_calls.append(
             {
@@ -71,6 +73,10 @@ class _FakeServer:
             }
         )
         yield "chunk"
+
+    async def generate_buffered(self, **kwargs):
+        self.generate_buffered_calls.append(kwargs)
+        return "buffered-result"
 
 
 class _FailRegisterServer(_FakeServer):
@@ -278,10 +284,17 @@ def test_add_request_ref_audio_latents_none_is_forwarded():
 
 def test_add_request_passes_lora_name_and_seed():
     srv = _make_server_impl()
-    srv.add_request("seq1", "hi", lora_name="my_lora", seed=99)
+    srv.add_request(
+        "seq1",
+        "hi",
+        lora_name="my_lora",
+        seed=99,
+        retry_badcase_ratio_threshold=4.5,
+    )
     req = srv.llm.added_requests[0]
     assert req["lora_name"] == "my_lora"
     assert req["seed"] == 99
+    assert req["retry_badcase_ratio_threshold"] == 4.5
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +623,36 @@ def test_pool_generate_updates_load_counter():
     asyncio.run(_pool_generate_updates_load_counter())
 
 
+async def _pool_generate_buffered_resolves_prompt_and_updates_load_counter():
+    s = _FakeServer()
+    pool = _make_pool([s])
+    pool._prompt_pool["pid1"] = {"latents": b"latents", "text": "prompt"}
+
+    result = await pool.generate_buffered("hello", prompt_id="pid1", seed=7)
+
+    assert result == "buffered-result"
+    assert pool.servers_load[0] == 0
+    assert s.generate_buffered_calls == [
+        {
+            "target_text": "hello",
+            "prompt_latents": b"latents",
+            "prompt_text": "prompt",
+            "max_generate_length": 2000,
+            "temperature": 1.0,
+            "cfg_value": 2.0,
+            "ref_audio_latents": None,
+            "lora_name": None,
+            "seed": 7,
+            "retry_badcase_max_times": 3,
+            "retry_badcase_ratio_threshold": 6.0,
+        }
+    ]
+
+
+def test_pool_generate_buffered_resolves_prompt_and_updates_load_counter():
+    asyncio.run(_pool_generate_buffered_resolves_prompt_and_updates_load_counter())
+
+
 # ---------------------------------------------------------------------------
 # AsyncVoxCPM2ServerPool – wait_for_ready and stop
 # ---------------------------------------------------------------------------
@@ -691,7 +734,7 @@ def test_async_server_forwards_control_plane_calls():
 
 
 async def _async_server_generate_completes_and_cleans_stream_state():
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _GenerationAttemptResult
 
     server = object.__new__(AsyncVoxCPM2Server)
     server.stream_table = {}
@@ -702,7 +745,7 @@ async def _async_server_generate_completes_and_cleans_stream_state():
         if command == "add_request":
             stream = server.stream_table[args[0]]
             await stream.put(np.array([1.0], dtype=np.float32))
-            await stream.put(None)
+            await stream.put(_GenerationAttemptResult(seed=42, generated_steps=1, is_badcase=False))
 
     server.submit = submit
 
@@ -742,3 +785,163 @@ async def _async_server_generate_cancels_when_consumer_closes_early():
 
 def test_async_server_generate_cancels_when_consumer_closes_early():
     asyncio.run(_async_server_generate_cancels_when_consumer_closes_early())
+
+
+async def _async_server_generate_buffered_retries_with_incremented_seed():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _GenerationAttemptResult
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    attempted_seeds = []
+
+    async def generate_attempt(**kwargs):
+        attempt_seed = kwargs["seed"]
+        attempted_seeds.append(attempt_seed)
+        yield np.array([float(attempt_seed)], dtype=np.float32)
+        yield _GenerationAttemptResult(
+            seed=attempt_seed,
+            generated_steps=12 if attempt_seed == 7 else 3,
+            is_badcase=attempt_seed == 7,
+        )
+
+    server._generate_attempt = generate_attempt
+    result = await server.generate_buffered("hello", seed=7)
+
+    assert attempted_seeds == [7, 8]
+    assert len(result.waveforms) == 1
+    assert result.waveforms[0].tolist() == [8.0]
+    assert result.seed == 8
+    assert result.attempt_count == 2
+    assert result.generated_steps == 3
+    assert result.failure_reason is None
+
+
+def test_async_server_generate_buffered_retries_with_incremented_seed():
+    asyncio.run(_async_server_generate_buffered_retries_with_incremented_seed())
+
+
+async def _async_server_generate_buffered_returns_structured_exhaustion():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _GenerationAttemptResult
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    attempted_seeds = []
+
+    async def generate_attempt(**kwargs):
+        attempt_seed = kwargs["seed"]
+        attempted_seeds.append(attempt_seed)
+        yield np.array([float(attempt_seed)], dtype=np.float32)
+        yield _GenerationAttemptResult(seed=attempt_seed, generated_steps=12, is_badcase=True)
+
+    server._generate_attempt = generate_attempt
+    result = await server.generate_buffered("hello", seed=20, retry_badcase_max_times=3)
+
+    assert attempted_seeds == [20, 21, 22]
+    assert result.waveforms == ()
+    assert result.seed == 22
+    assert result.attempt_count == 3
+    assert result.generated_steps == 12
+    assert result.failure_reason == "badcase_retry_exhausted"
+
+
+def test_async_server_generate_buffered_returns_structured_exhaustion():
+    asyncio.run(_async_server_generate_buffered_returns_structured_exhaustion())
+
+
+async def _async_server_generate_buffered_requires_positive_attempt_count():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    with pytest.raises(ValueError, match="retry_badcase_max_times must be >= 1"):
+        await server.generate_buffered("hello", retry_badcase_max_times=0)
+
+
+def test_async_server_generate_buffered_requires_positive_attempt_count():
+    asyncio.run(_async_server_generate_buffered_requires_positive_attempt_count())
+
+
+def test_main_loop_emits_structured_attempt_completion(monkeypatch):
+    from queue import Empty
+
+    import nanovllm_voxcpm.models.voxcpm2.server as server_module
+
+    class _Payload:
+        generated_waveforms = [np.array([1.0], dtype=np.float32)]
+        seed = 17
+        is_badcase = True
+
+    class _Sequence:
+        seq_id = "seq-1"
+        custom_payload = _Payload()
+        is_finished = True
+
+    class _Server:
+        def __init__(self):
+            self.finished = False
+
+        def add_request(self):
+            return None
+
+        def is_finished(self):
+            return self.finished
+
+        def step(self):
+            self.finished = True
+            return [_Sequence()]
+
+    class _QueueIn:
+        def __init__(self):
+            self.commands = [
+                {"id": "add", "type": "add_request", "args": (), "kwargs": {}},
+                {"id": "stop", "type": "stop", "args": (), "kwargs": {}},
+            ]
+
+        def get(self):
+            return self.commands.pop(0)
+
+        def get_nowait(self):
+            raise Empty
+
+    class _QueueOut:
+        def __init__(self):
+            self.messages = []
+
+        def put(self, message):
+            self.messages.append(message)
+
+    fake_server = _Server()
+    queue_out = _QueueOut()
+    monkeypatch.setattr(server_module, "VoxCPM2ServerImpl", lambda *args, **kwargs: fake_server)
+    monkeypatch.setenv("NANOVLLM_QUEUE_COALESCE_MS", "0")
+
+    server_module.main_loop(_QueueIn(), queue_out, (), {})
+
+    stream_messages = [message for message in queue_out.messages if message["type"] == "stream"]
+    assert len(stream_messages) == 2
+    completion = stream_messages[-1]["data"]
+    assert completion.seed == 17
+    assert completion.generated_steps == 1
+    assert completion.is_badcase is True
+
+
+def test_sync_server_pool_exposes_buffered_generation():
+    from nanovllm_voxcpm.models.voxcpm2.server import SyncVoxCPM2ServerPool
+
+    class _AsyncPool:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_buffered(self, **kwargs):
+            self.calls.append(kwargs)
+            return "result"
+
+    server = object.__new__(SyncVoxCPM2ServerPool)
+    server.loop = asyncio.new_event_loop()
+    server.server_pool = _AsyncPool()
+    try:
+        result = server.generate_buffered("hello", seed=7)
+    finally:
+        server.loop.close()
+
+    assert result == "result"
+    assert server.server_pool.calls[0]["target_text"] == "hello"
+    assert server.server_pool.calls[0]["seed"] == 7
+    assert server.server_pool.calls[0]["retry_badcase_max_times"] == 3

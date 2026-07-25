@@ -49,6 +49,49 @@ def test_add_request_requires_positive_max_generate_length():
         e.add_request(seq_id="s", target_text="x", max_generate_length=0)
 
 
+def test_add_request_applies_openbmb_text_relative_limit():
+    e = _make_engine(max_model_len=64, token_count=2)
+    e.add_request(seq_id="s", target_text="x", max_generate_length=2000)
+
+    payload = e._captured_seq.custom_payload
+    assert payload.target_text_length == 2
+    assert payload.retry_badcase_ratio_threshold == 6.0
+    assert payload.max_generate_length == 22
+
+
+def test_add_request_excludes_prompt_text_from_text_relative_limit():
+    e = _make_engine(max_model_len=64, token_count=2)
+    e.tokenizer = lambda text: [1, 2] if text == "target" else list(range(20))
+    e.add_request(
+        seq_id="s",
+        target_text="target",
+        prompt_text="prompt",
+        max_generate_length=2000,
+    )
+
+    payload = e._captured_seq.custom_payload
+    assert payload.target_text_length == 2
+    assert payload.max_generate_length == 22
+
+
+def test_add_request_preserves_lower_requested_limit():
+    e = _make_engine(max_model_len=16, token_count=2)
+    e.add_request(seq_id="s", target_text="x", max_generate_length=7)
+
+    assert e._captured_seq.custom_payload.max_generate_length == 7
+
+
+def test_add_request_requires_positive_badcase_ratio():
+    e = _make_engine(max_model_len=16, token_count=2)
+    with pytest.raises(ValueError, match=r"retry_badcase_ratio_threshold must be > 0"):
+        e.add_request(
+            seq_id="s",
+            target_text="x",
+            max_generate_length=7,
+            retry_badcase_ratio_threshold=0,
+        )
+
+
 def test_add_request_resolves_lora_name_into_adapter_id():
     e = _make_engine(max_model_len=11, token_count=4)
     e.add_request(seq_id="s", target_text="x", max_generate_length=6, lora_name="demo")
@@ -78,6 +121,8 @@ def test_postprocess_advances_seed_step_after_generated_latent():
                 generated_waveforms=[],
                 temperature=1.0,
                 cfg_value=1.0,
+                target_text_length=10,
+                retry_badcase_ratio_threshold=6.0,
                 max_generate_length=10,
                 seed=123,
                 seed_step=2,
@@ -98,3 +143,55 @@ def test_postprocess_advances_seed_step_after_generated_latent():
     )
 
     assert seq.custom_payload.seed_step == 3
+
+
+@pytest.mark.parametrize(
+    ("prior_steps", "expected_badcase"),
+    [
+        (4, False),
+        (11, True),
+    ],
+)
+def test_postprocess_uses_openbmb_audio_text_ratio_detector(prior_steps, expected_badcase):
+    import numpy as np
+
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine, VoxCPM2SeqPayload
+
+    engine = VoxCPM2Engine.__new__(VoxCPM2Engine)
+    engine.feat_dim = 2
+    engine.patch_size = 4
+    engine.n_decode_pad_frames = 4
+
+    class _Seq:
+        stoped = False
+
+        def __init__(self):
+            self.tokens = []
+            self.custom_payload = VoxCPM2SeqPayload(
+                feats=[],
+                text_tokens=[],
+                feat_masks=[],
+                generated_waveforms=[np.zeros(8, dtype=np.float32) for _ in range(prior_steps)],
+                temperature=1.0,
+                cfg_value=1.0,
+                target_text_length=2,
+                retry_badcase_ratio_threshold=6.0,
+                max_generate_length=22,
+            )
+
+        def append_token(self, token):
+            self.tokens.append(token)
+
+    seq = _Seq()
+    engine.postprocess_seq(
+        seq,
+        {
+            "latents": np.zeros((engine.patch_size, engine.feat_dim), dtype=np.float32),
+            "waveforms": np.zeros(8, dtype=np.float32),
+            "stop_flag": 1,
+        },
+        is_prefill=False,
+    )
+
+    assert seq.stoped is True
+    assert seq.custom_payload.is_badcase is expected_badcase

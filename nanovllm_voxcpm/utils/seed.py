@@ -1,7 +1,17 @@
+import torch
+
 _UINT64_MASK = (1 << 64) - 1
 _SPLITMIX64_INCREMENT = 0x9E3779B97F4A7C15
 _SPLITMIX64_MUL1 = 0xBF58476D1CE4E5B9
 _SPLITMIX64_MUL2 = 0x94D049BB133111EB
+
+
+def materialize_generation_seed(seed: int | None) -> int:
+    """Return a concrete seed for a generation request."""
+
+    if seed is not None:
+        return int(seed)
+    return int(torch.seed() & 0xFFFFFFFF)
 
 
 def derive_step_seed(seed: int, seed_step: int) -> int:

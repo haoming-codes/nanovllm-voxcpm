@@ -7,6 +7,7 @@ from nanovllm_voxcpm.models.voxcpm2.server import (
     AsyncVoxCPM2ServerPool,
     SyncVoxCPM2ServerPool,
     VoxCPM2ServerImpl,
+    VoxCPM2GenerationResult,
 )
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "SyncVoxCPM2ServerPool",
     "VoxCPM2Config",
     "VoxCPM2Engine",
+    "VoxCPM2GenerationResult",
     "VoxCPM2Model",
     "VoxCPM2Runner",
     "VoxCPM2ServerImpl",
