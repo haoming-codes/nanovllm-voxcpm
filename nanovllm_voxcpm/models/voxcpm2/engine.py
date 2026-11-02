@@ -141,7 +141,7 @@ class VoxCPM2Engine(LLMEngineBase):
         )
         if reached_model_stop or reached_max_generate_length:
             seq.stoped = True
-            seq.custom_payload.is_badcase = len(seq.custom_payload.generated_waveforms) >= (
+            seq.custom_payload.is_badcase = len(seq.custom_payload.generated_waveforms) > (
                 max(
                     _MIN_BADCASE_GENERATED_STEPS,
                     seq.custom_payload.target_text_length * seq.custom_payload.retry_badcase_ratio_threshold,
