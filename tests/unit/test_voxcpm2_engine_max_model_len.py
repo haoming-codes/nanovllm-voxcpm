@@ -171,15 +171,18 @@ def test_postprocess_advances_seed_step_after_generated_latent():
 
 
 @pytest.mark.parametrize(
-    ("prior_steps", "expected_badcase"),
+    ("target_tokens", "prior_steps", "expected_badcase"),
     [
-        (4, False),
-        (11, False),
-        (14, False),
-        (15, True),
+        (2, 4, False),
+        (2, 11, False),
+        (2, 14, False),
+        (2, 15, False),
+        (2, 16, True),
+        (4, 23, False),
+        (4, 24, True),
     ],
 )
-def test_postprocess_uses_short_text_floor_in_ratio_detector(prior_steps, expected_badcase):
+def test_postprocess_uses_short_text_floor_in_ratio_detector(target_tokens, prior_steps, expected_badcase):
     import numpy as np
 
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine, VoxCPM2SeqPayload
@@ -201,9 +204,9 @@ def test_postprocess_uses_short_text_floor_in_ratio_detector(prior_steps, expect
                 generated_waveforms=[np.zeros(8, dtype=np.float32) for _ in range(prior_steps)],
                 temperature=1.0,
                 cfg_value=1.0,
-                target_text_length=2,
+                target_text_length=target_tokens,
                 retry_badcase_ratio_threshold=6.0,
-                max_generate_length=22,
+                max_generate_length=max(16, target_tokens * 6) + 10,
             )
 
         def append_token(self, token):

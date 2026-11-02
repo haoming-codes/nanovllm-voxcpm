@@ -176,7 +176,9 @@ wav = np.concatenate(result.waveforms, axis=0)
 print(result.seed, result.attempt_count, result.generated_steps)
 ```
 
-An attempt is rejected when its generated step count reaches `badcase_steps`.
+An attempt is rejected when its generated step count exceeds `badcase_steps`.
+Model-ended audio exactly at the boundary is accepted; the hard cap still
+terminates longer attempts and exhausted retries still return no audio.
 The floor is 2.56 seconds at VoxCPM2's native 160 ms per step; it avoids
 rejecting ordinary short interjections solely because of their token count.
 It remains a length heuristic, not a content or silence detector. The budget
