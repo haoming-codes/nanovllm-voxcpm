@@ -17,6 +17,23 @@ from nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
 _MIN_BADCASE_GENERATED_STEPS = 16
 
 
+def _spoken_target_text(target_text: str) -> str:
+    text = target_text.lstrip()
+    while text.startswith("("):
+        depth = 0
+        for index, character in enumerate(text):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            if depth == 0:
+                text = text[index + 1 :].lstrip()
+                break
+        else:
+            return text
+    return text
+
+
 @dataclass
 class VoxCPM2SeqPayload:
     feats: list[np.ndarray]
@@ -150,7 +167,9 @@ class VoxCPM2Engine(LLMEngineBase):
         if not math.isfinite(retry_badcase_ratio_threshold) or retry_badcase_ratio_threshold <= 0:
             raise ValueError("retry_badcase_ratio_threshold must be > 0, " f"got {retry_badcase_ratio_threshold}")
 
-        target_text_length = len(self.tokenizer(target_text))
+        # Leading parenthesized instructions condition the voice; they are not spoken.
+        spoken_text = _spoken_target_text(target_text)
+        target_text_length = len(self.tokenizer(spoken_text))
         max_generate_length = min(
             int(max(_MIN_BADCASE_GENERATED_STEPS, target_text_length * retry_badcase_ratio_threshold) + 10),
             max_generate_length,

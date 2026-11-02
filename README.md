@@ -152,7 +152,7 @@ VoxCPM2 bounds both streaming and buffered requests relative to target text,
 with a 16-step floor for short interjections:
 
 ```text
-badcase_steps = max(16, target_text_token_count * retry_badcase_ratio_threshold)
+badcase_steps = max(16, spoken_target_token_count * retry_badcase_ratio_threshold)
 generation_limit = min(max_generate_length, badcase_steps + 10)
 ```
 
@@ -179,8 +179,9 @@ print(result.seed, result.attempt_count, result.generated_steps)
 An attempt is rejected when its generated step count reaches `badcase_steps`.
 The floor is 2.56 seconds at VoxCPM2's native 160 ms per step; it avoids
 rejecting ordinary short interjections solely because of their token count.
-It remains a length heuristic, not a content or silence detector. Target
-tokens include control instructions but exclude prompt text. User hard limits
+It remains a length heuristic, not a content or silence detector. The budget
+counts spoken target tokens, excluding leading parenthesized control instructions
+and prompt text. Instructions still reach the model unchanged. User hard limits
 are still respected. Worker crashes propagate as errors and discard partial
 buffered audio; they do not consume retries as if they were bad-case completions.
 
