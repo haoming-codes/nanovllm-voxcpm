@@ -87,7 +87,7 @@ def test_add_request_preserves_lower_requested_limit():
     assert e._captured_seq.custom_payload.max_generate_length == 7
 
 
-@pytest.mark.parametrize("ratio", [0, -1, float('nan'), float('inf')])
+@pytest.mark.parametrize("ratio", [0, -1, float("nan"), float("inf")])
 def test_add_request_requires_positive_finite_badcase_ratio(ratio):
     e = _make_engine(max_model_len=16, token_count=2)
     with pytest.raises(ValueError, match=r"retry_badcase_ratio_threshold must be > 0"):
