@@ -4,6 +4,7 @@ from multiprocessing.synchronize import Event
 
 import numpy as np
 import torch
+from torch.nn.utils import remove_weight_norm
 
 from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, RunnerTask
@@ -29,6 +30,7 @@ class VoxCPM2Payload:
 class VoxCPM2Runner(BaseModelRunner):
     model: VoxCPM2Model
     dit_lora_seq_len_offset = 3
+    vae_dtype = torch.float16
 
     def __init__(
         self,
@@ -56,7 +58,17 @@ class VoxCPM2Runner(BaseModelRunner):
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
+        self._prepare_vae_decoder_for_inference()
+        self.vae_streaming_decoder = self.vae.streaming_decoder(self._config.max_num_seqs)
+        self.vae_streaming_decoder.warmup(self.feat_dim, self.patch_size)
         torch.set_default_dtype(torch.bfloat16)
+
+    def _prepare_vae_decoder_for_inference(self) -> None:
+        """Fold weight norm and cast only the inference decoder to FP16."""
+        for module in self.vae.decoder.modules():
+            if hasattr(module, "weight_g"):
+                remove_weight_norm(module)
+        self.vae.decoder.to(dtype=self.vae_dtype)
 
     def make_dummy_inputs(self, batch_size: int, length: int) -> dict[str, torch.Tensor]:
         return {
@@ -105,6 +117,9 @@ class VoxCPM2Runner(BaseModelRunner):
             temperatures.append(payload.temperature)
             cfg_values.append(payload.cfg_value)
 
+        if is_prefill:
+            # Decide from host metadata; inspecting the CUDA mask would sync.
+            inputs["text_only_prefill"] = not any(mask.any() for mask in feat_masks)
         inputs["text_tokens"] = torch.from_numpy(np.concatenate(text_tokens, axis=0)).cuda(non_blocking=True)
         inputs["feat"] = torch.from_numpy(np.concatenate(feats, axis=0)).cuda(non_blocking=True).to(self.dtype)
         inputs["feat_mask"] = torch.from_numpy(np.concatenate(feat_masks, axis=0)).cuda(non_blocking=True)
@@ -137,31 +152,65 @@ class VoxCPM2Runner(BaseModelRunner):
         outputs = self.run_model(inputs, is_prefill)
         latents = outputs["latents"]
 
-        pad_lengths = [
-            seq.custom_payload.padding_decode.shape[0] if seq.custom_payload.padding_decode is not None else 0
-            for seq in seqs
-        ]
-
-        max_pad_decode = max(pad_lengths) + self.patch_size
-        vae_decoder_inputs = torch.zeros(len(seqs), max_pad_decode, self.feat_dim, dtype=torch.float32, device="cuda")
-        for i, seq in enumerate(seqs):
-            pad_len = pad_lengths[i]
-            if pad_len > 0:
-                vae_decoder_inputs[i, :pad_len] = torch.from_numpy(seq.custom_payload.padding_decode).cuda(
-                    non_blocking=True
+        if all(getattr(seq, "seq_id", None) is not None for seq in seqs):
+            initial_contexts = []
+            for seq in seqs:
+                padding_decode = seq.custom_payload.padding_decode
+                initial_contexts.append(
+                    None
+                    if padding_decode is None
+                    else torch.from_numpy(padding_decode)
+                    .to(device="cuda", dtype=self.vae_dtype, non_blocking=True)
+                    .transpose(0, 1)
+                    .unsqueeze(0)
                 )
-            vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(torch.float32)
-
-        vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :].cpu().numpy()
-        stop_flag = outputs["stop_flag"].cpu().tolist()
-        ret_waveforms = []
-        for i, pad_len in enumerate(pad_lengths):
-            ret_waveforms.append(
-                vae_decoder_outputs[
-                    i,
-                    pad_len * self.vae.decoder_chunk_size : (pad_len + self.patch_size) * self.vae.decoder_chunk_size,
-                ]
+            vae_decoder_outputs = (
+                self.vae_streaming_decoder.decode_chunks(
+                    latents.to(self.vae_dtype).permute(0, 2, 1),
+                    [seq.seq_id for seq in seqs],
+                    initial_contexts,
+                )[:, 0, :]
+                .to(torch.float32)
+                .cpu()
+                .numpy()
             )
+            ret_waveforms = [vae_decoder_outputs[i] for i in range(len(seqs))]
+        else:
+            pad_lengths = [
+                seq.custom_payload.padding_decode.shape[0] if seq.custom_payload.padding_decode is not None else 0
+                for seq in seqs
+            ]
+            max_pad_decode = max(pad_lengths) + self.patch_size
+            vae_decoder_inputs = torch.zeros(
+                len(seqs),
+                max_pad_decode,
+                self.feat_dim,
+                dtype=self.vae_dtype,
+                device="cuda",
+            )
+            for i, seq in enumerate(seqs):
+                pad_len = pad_lengths[i]
+                if pad_len > 0:
+                    vae_decoder_inputs[i, :pad_len] = torch.from_numpy(seq.custom_payload.padding_decode).cuda(
+                        non_blocking=True
+                    )
+                vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(self.vae_dtype)
+            vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :]
+            if isinstance(vae_decoder_outputs, torch.Tensor):
+                vae_decoder_outputs = vae_decoder_outputs.to(torch.float32)
+            vae_decoder_outputs = vae_decoder_outputs.cpu().numpy()
+            ret_waveforms = []
+            for i, pad_len in enumerate(pad_lengths):
+                ret_waveforms.append(
+                    vae_decoder_outputs[
+                        i,
+                        pad_len
+                        * self.vae.decoder_chunk_size : (pad_len + self.patch_size)
+                        * self.vae.decoder_chunk_size,
+                    ]
+                )
+
+        stop_flag = outputs["stop_flag"].cpu().tolist()
 
         np_latents = latents.to(torch.float32).cpu().numpy()
         return [

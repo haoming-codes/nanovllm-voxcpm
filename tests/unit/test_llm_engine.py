@@ -134,6 +134,9 @@ def test_engine_step_finishes_sequence_and_supports_cancel(monkeypatch, tmp_path
     assert "lora_on_sequence_enqueued" in runner_calls
     assert "lora_on_sequence_started" in runner_calls
     assert "lora_on_sequence_finished" in runner_calls
+    assert runner_calls.count("release_sequence_state") == 2
+    release_calls = [args for name, args in _DummyRunner.instances[0].calls if name == "release_sequence_state"]
+    assert release_calls == [("cancelled",), ("seq-1",)]
 
 
 def test_engine_registers_and_unregisters_lora(monkeypatch, tmp_path):

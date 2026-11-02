@@ -142,13 +142,31 @@ def _pack_int_tensors_to_cuda(*lists: list[int]) -> list[torch.Tensor]:
     return out
 
 
-def build_lora_context_from_batch_plan(plan: LoRABatchPlan) -> LoRAContext:
+def build_lora_context_from_batch_plan(
+    plan: LoRABatchPlan,
+    *,
+    materialize_device: bool = True,
+) -> LoRAContext:
+    if not materialize_device:
+        return LoRAContext(
+            no_lora_flag=not plan.active_slot_ids,
+            num_active_loras=len(plan.active_slot_ids),
+            host_token_to_slot=plan.token_to_slot,
+            host_token_indices_sorted_by_slot=plan.token_indices_sorted_by_slot,
+            host_active_slot_ids=plan.active_slot_ids,
+            host_num_tokens_per_slot=plan.num_tokens_per_slot,
+        )
+
     if not plan.active_slot_ids:
         token_to_slot_tensor = _cuda_int_tensor(plan.token_to_slot)
         return LoRAContext(
             token_to_slot=token_to_slot_tensor,
             no_lora_flag=True,
             num_active_loras=0,
+            host_token_to_slot=plan.token_to_slot,
+            host_token_indices_sorted_by_slot=plan.token_indices_sorted_by_slot,
+            host_active_slot_ids=plan.active_slot_ids,
+            host_num_tokens_per_slot=plan.num_tokens_per_slot,
         )
 
     (
@@ -173,11 +191,42 @@ def build_lora_context_from_batch_plan(plan: LoRABatchPlan) -> LoRAContext:
         slot_start_offsets=slot_start_offsets_tensor,
         no_lora_flag=False,
         num_active_loras=len(plan.active_slot_ids),
+        host_token_to_slot=plan.token_to_slot,
+        host_token_indices_sorted_by_slot=plan.token_indices_sorted_by_slot,
+        host_active_slot_ids=plan.active_slot_ids,
+        host_num_tokens_per_slot=plan.num_tokens_per_slot,
     )
 
 
-def build_lora_context_from_slot_list(token_to_slot: list[int]) -> LoRAContext:
-    return build_lora_context_from_batch_plan(build_lora_batch_plan_from_token_to_slot({}, token_to_slot))
+def build_lora_context_from_slot_list(
+    token_to_slot: list[int],
+    *,
+    materialize_device: bool = True,
+) -> LoRAContext:
+    return build_lora_context_from_batch_plan(
+        build_lora_batch_plan_from_token_to_slot({}, token_to_slot),
+        materialize_device=materialize_device,
+    )
+
+
+def materialize_lora_context(context: LoRAContext) -> LoRAContext:
+    """Create device metadata for a host-only graph context on eager fallback."""
+    if context.token_to_slot is not None or context.host_token_to_slot is None:
+        return context
+
+    host_counts = context.host_num_tokens_per_slot or []
+    slot_start_offsets = [0]
+    for count in host_counts:
+        slot_start_offsets.append(slot_start_offsets[-1] + count)
+    plan = LoRABatchPlan(
+        adapter_to_slot={},
+        token_to_slot=context.host_token_to_slot,
+        token_indices_sorted_by_slot=context.host_token_indices_sorted_by_slot or [],
+        active_slot_ids=context.host_active_slot_ids or [],
+        num_tokens_per_slot=host_counts,
+        slot_start_offsets=slot_start_offsets,
+    )
+    return build_lora_context_from_batch_plan(plan)
 
 
 class _LoRAStateBase:

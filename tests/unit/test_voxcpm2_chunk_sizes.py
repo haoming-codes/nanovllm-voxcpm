@@ -43,6 +43,25 @@ def test_audio_vae_v2_uses_fixed_batch_shaped_sr_idx():
     assert sr_idx.tolist() == [3, 3, 3]
 
 
+def test_voxcpm2_runner_prepares_fp16_decoder_and_folds_weight_norm():
+    from torch import nn
+    from torch.nn.utils import weight_norm
+
+    from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
+
+    runner = VoxCPM2Runner.__new__(VoxCPM2Runner)
+    runner.vae = type("_VAE", (), {})()
+    runner.vae.decoder = nn.Sequential(weight_norm(nn.Conv1d(2, 2, kernel_size=1)))
+
+    runner._prepare_vae_decoder_for_inference()
+
+    conv = runner.vae.decoder[0]
+    assert conv.weight.dtype == torch.float16
+    assert not hasattr(conv, "weight_g")
+    assert not hasattr(conv, "weight_v")
+    assert conv._forward_pre_hooks == {}
+
+
 def test_voxcpm2_engine_aligns_prompt_audio_with_encoder_chunk_size():
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 

@@ -70,6 +70,7 @@ class VoxCPM2Engine(LLMEngineBase):
                     seed_step=seq.custom_payload.seed_step,
                 ),
                 adapter_id=seq.adapter_id,
+                seq_id=seq.seq_id,
             )
 
         return RunnerTask(
@@ -88,6 +89,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 seed_step=seq.custom_payload.seed_step,
             ),
             adapter_id=seq.adapter_id,
+            seq_id=seq.seq_id,
         )
 
     def postprocess_seq(self, seq: Sequence[VoxCPM2SeqPayload], outputs: dict, is_prefill: bool):

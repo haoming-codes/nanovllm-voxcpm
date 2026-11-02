@@ -189,6 +189,7 @@ class LLMEngineBase:
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:
         self.lora_manager.on_sequence_finished(seq.adapter_id, was_running=was_running)
         self.model_runner.call("lora_on_sequence_finished", seq.adapter_id, was_running)
+        self.model_runner.call("release_sequence_state", seq.seq_id)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
