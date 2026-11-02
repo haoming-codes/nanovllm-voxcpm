@@ -209,6 +209,52 @@ def test_dit_lora_rows_per_sample_with_dit_enabled():
     assert runner._dit_lora_rows_per_sample() == 40
 
 
+def test_expand_dit_lora_slots_uses_cfg_branch_major_order():
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    assert expand_dit_lora_slots([3, 7], sequence_length=2, cfg_branches=2) == [
+        3,
+        3,
+        7,
+        7,
+        3,
+        3,
+        7,
+        7,
+    ]
+
+
+def test_expand_dit_lora_slots_no_cross_voice_bleed_when_co_batched():
+    """Regression for PR #80: two distinct voices in one DiT batch must not
+    share adapters. Pre-fix sample-major expansion made sample B's cond rows
+    run under sample A's adapter, blending both voices.
+    """
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    slot_a, slot_b = 3, 7
+    sample_to_slot = [slot_a, slot_b]
+    seq_len = 3
+    cfg_branches = 2
+
+    rows = expand_dit_lora_slots(sample_to_slot, sequence_length=seq_len, cfg_branches=cfg_branches)
+
+    assert len(rows) == cfg_branches * len(sample_to_slot) * seq_len
+
+    block = 0
+    for branch in range(cfg_branches):
+        for sample_idx, expected_slot in enumerate(sample_to_slot):
+            seq_rows = rows[block * seq_len : (block + 1) * seq_len]
+            assert seq_rows == [expected_slot] * seq_len, (
+                f"branch {branch} sample {sample_idx} rows {seq_rows} "
+                f"leaked another voice's adapter (expected all {expected_slot})"
+            )
+            block += 1
+
+    b_rows = [slot for slot in rows if slot == slot_b]
+    assert slot_a not in b_rows
+    assert b_rows == [slot_b] * (cfg_branches * seq_len)
+
+
 @pytest.mark.gpu
 def test_build_lora_contexts_no_adapters_returns_empty_lm_and_no_lora_flags():
     import nanovllm_voxcpm.engine.model_runner as model_runner
@@ -767,6 +813,8 @@ def test_make_graph_domain_buffers_shapes():
 
     assert (buffers["token_to_slot"] == -1).all()
     assert buffers["active_slot_ids"].tolist() == [-1, 0, 1]
+    assert "host_staging" not in buffers
+    assert "copy_event" not in buffers
 
 
 def test_write_shm_inline_small_payload():
@@ -879,7 +927,14 @@ def test_build_lora_contexts_with_active_adapter():
     from nanovllm_voxcpm.utils.context import LM_LORA_DOMAIN, PROJ_LORA_DOMAIN, DIT_LORA_DOMAIN
 
     runner = object.__new__(model_runner.BaseModelRunner)
-    runner.lora_config = None
+
+    class _FakeLoraCfg:
+        enable_dit = True
+
+    runner.lora_config = _FakeLoraCfg()
+    runner.cfg_branches = 2
+    runner.dit_lora_seq_len_offset = 0
+    runner.patch_size = 1
     runtime = LoRARuntime(max_loras=2, max_lora_rank=4)
     payload = LoRAModelPayload(modules={}, rank=1, alpha=1.0)
     runtime.register_lora("adapter_a", payload, adapter_id=3)
@@ -914,6 +969,7 @@ def test_build_lora_contexts_with_active_adapter():
     assert DIT_LORA_DOMAIN in contexts
     assert len(load_calls) == 1
     assert load_calls[0] == ([3, None], [2, 1])
+    assert contexts[DIT_LORA_DOMAIN].token_to_slot.tolist() == [0, 0, -1, -1, 0, 0, -1, -1]
 
 
 def test_load_lora_slot_unknown_module_raises():
@@ -989,6 +1045,47 @@ def test_load_lora_slot_initializes_slot_modules_dict():
     assert runner._lora_slot_modules[0] == []
 
 
+def test_load_lora_slot_skips_first_clear_and_only_clears_removed_modules():
+    from types import SimpleNamespace
+
+    import nanovllm_voxcpm.engine.model_runner as model_runner
+
+    calls = []
+
+    class FakeTensor:
+        def to(self, **kwargs):
+            return self
+
+    class FakeModule:
+        def __init__(self, name):
+            self.name = name
+
+        def clear_slot_lora(self, slot_id):
+            calls.append(("clear", self.name, slot_id))
+
+        def set_slot_lora(self, **kwargs):
+            calls.append(("set", self.name, kwargs["slot_id"]))
+
+    modules = {name: FakeModule(name) for name in ("a", "b")}
+    runner = object.__new__(model_runner.BaseModelRunner)
+    runner._lora_model_modules_cache = modules
+    runner._lora_slot_modules = {}
+    module_payload = SimpleNamespace(
+        lora_a=FakeTensor(),
+        lora_b=FakeTensor(),
+        effective_rank=1,
+        scaling=1.0,
+    )
+
+    runner._load_lora_slot(0, SimpleNamespace(modules={"a": module_payload}))
+    assert calls == [("set", "a", 0)]
+
+    calls.clear()
+    runner._lora_slot_modules[0] = ["a", "b"]
+    runner._load_lora_slot(0, SimpleNamespace(modules={"a": module_payload}))
+    assert calls == [("clear", "b", 0), ("set", "a", 0)]
+
+
 def test_exit_single_rank_enforce_eager_skips_graphs(monkeypatch):
     import nanovllm_voxcpm.engine.model_runner as model_runner
 
@@ -1014,11 +1111,15 @@ def test_exit_single_rank_non_eager_deletes_graphs(monkeypatch):
     runner.enforce_eager = False
     runner.graphs = {"base": {}, "lora": {}}
     runner.graph_pool = object()
+    runner.prefill_diffusion_graphs = {"base": {}, "lora": {}}
+    runner.prefill_diffusion_graph_vars = {}
 
     runner.exit()
 
     assert not hasattr(runner, "graphs")
     assert not hasattr(runner, "graph_pool")
+    assert not hasattr(runner, "prefill_diffusion_graphs")
+    assert not hasattr(runner, "prefill_diffusion_graph_vars")
 
 
 def _make_domain_vars(max_rows: int, max_lora_buckets: int) -> dict:
@@ -1029,6 +1130,89 @@ def _make_domain_vars(max_rows: int, max_lora_buckets: int) -> dict:
         "num_tokens_per_slot": torch.zeros(max_lora_buckets, dtype=torch.int32),
         "slot_start_offsets": torch.zeros(max_lora_buckets + 1, dtype=torch.int32),
     }
+
+
+def _make_host_staged_domain_vars(max_rows: int, max_lora_buckets: int) -> dict:
+    sizes = [max_rows, max_rows, max_lora_buckets, max_lora_buckets, max_lora_buckets + 1]
+    offsets = [0]
+    for size in sizes:
+        offsets.append(offsets[-1] + size)
+    packed = torch.empty(sum(sizes), dtype=torch.int32)
+    host = torch.empty_like(packed)
+
+    class FakeEvent:
+        def __init__(self):
+            self.recorded = 0
+            self.synchronized = 0
+
+        def record(self):
+            self.recorded += 1
+
+        def synchronize(self):
+            self.synchronized += 1
+
+    return {
+        "packed": packed,
+        "host_staging": host,
+        "copy_event": FakeEvent(),
+        "copy_pending": False,
+        "token_to_slot": packed[offsets[0] : offsets[1]],
+        "token_indices_sorted_by_slot": packed[offsets[1] : offsets[2]],
+        "active_slot_ids": packed[offsets[2] : offsets[3]],
+        "num_tokens_per_slot": packed[offsets[3] : offsets[4]],
+        "slot_start_offsets": packed[offsets[4] : offsets[5]],
+        "host_token_to_slot": host[offsets[0] : offsets[1]],
+        "host_token_indices_sorted_by_slot": host[offsets[1] : offsets[2]],
+        "host_active_slot_ids": host[offsets[2] : offsets[3]],
+        "host_num_tokens_per_slot": host[offsets[3] : offsets[4]],
+        "host_slot_start_offsets": host[offsets[4] : offsets[5]],
+    }
+
+
+def test_copy_lora_domain_uses_one_host_staged_metadata_copy():
+    import nanovllm_voxcpm.engine.model_runner as model_runner
+    from nanovllm_voxcpm.utils.context import LM_LORA_DOMAIN, LoRAContext
+
+    runner = object.__new__(model_runner.BaseModelRunner)
+    domain_vars = _make_host_staged_domain_vars(max_rows=6, max_lora_buckets=3)
+    domain_vars["host_active_slot_ids"].copy_(torch.tensor([-1, 0, 1], dtype=torch.int32))
+    graph_vars = {"lora_domains": {LM_LORA_DOMAIN: domain_vars}}
+    context = LoRAContext(
+        token_to_slot=torch.tensor([1, -1, 0], dtype=torch.int32),
+        no_lora_flag=False,
+        num_active_loras=2,
+        host_token_to_slot=[1, -1, 0],
+        host_token_indices_sorted_by_slot=[2, 0],
+        host_active_slot_ids=[0, 1],
+        host_num_tokens_per_slot=[1, 1],
+    )
+
+    runner._copy_lora_domain_to_graph_vars(graph_vars, LM_LORA_DOMAIN, context)
+
+    assert domain_vars["copy_event"].recorded == 1
+    assert domain_vars["token_to_slot"].tolist() == [1, -1, 0, -1, -1, -1]
+    assert domain_vars["token_indices_sorted_by_slot"][:2].tolist() == [2, 0]
+    assert domain_vars["num_tokens_per_slot"].tolist() == [0, 1, 1]
+    assert domain_vars["slot_start_offsets"].tolist() == [0, 0, 1, 2]
+
+
+def test_copy_lora_domain_waits_before_reusing_host_staging():
+    import nanovllm_voxcpm.engine.model_runner as model_runner
+    from nanovllm_voxcpm.utils.context import LM_LORA_DOMAIN, LoRAContext
+
+    runner = object.__new__(model_runner.BaseModelRunner)
+    domain_vars = _make_host_staged_domain_vars(max_rows=2, max_lora_buckets=1)
+    domain_vars["copy_pending"] = True
+    graph_vars = {"lora_domains": {LM_LORA_DOMAIN: domain_vars}}
+
+    runner._copy_lora_domain_to_graph_vars(
+        graph_vars,
+        LM_LORA_DOMAIN,
+        LoRAContext(no_lora_flag=True, num_active_loras=0),
+    )
+
+    assert domain_vars["copy_event"].synchronized == 1
+    assert domain_vars["copy_event"].recorded == 1
 
 
 def test_copy_lora_domain_no_lora_flag_resets_to_sentinel():
@@ -1425,3 +1609,153 @@ def test_allocate_kv_cache_pre_set_num_blocks_skips_auto(monkeypatch):
 
     assert cuda_called == []
     assert runner._config.num_kvcache_blocks == 100
+
+
+def test_prefill_diffusion_graph_pads_to_bucket_and_returns_real_batch(monkeypatch):
+    import nanovllm_voxcpm.engine.model_runner as model_runner
+    from nanovllm_voxcpm.utils.context import DIT_LORA_DOMAIN, LoRAContext
+
+    runner = object.__new__(model_runner.BaseModelRunner)
+    runner.graph_bs = [1, 2, 4]
+
+    diffusion_inputs = {
+        "mu": torch.arange(9, dtype=torch.float32).reshape(3, 3),
+        "cond": torch.ones(3, 3, 2),
+        "temperature": torch.ones(3),
+        "cfg_value": torch.ones(3),
+        "z_noise": torch.ones(3, 3, 2),
+    }
+
+    class FakeModel:
+        def forward_backbone(self, **inputs):
+            return diffusion_inputs, {"stop_flag": torch.tensor([0, 1, 0])}
+
+        def forward_diffusion(self, **inputs):
+            raise AssertionError("captured graph should be replayed")
+
+    runner.model = FakeModel()
+    graph_inputs = {
+        name: torch.full((4, *value.shape[1:]), -1, dtype=value.dtype) for name, value in diffusion_inputs.items()
+    }
+    graph_outputs = torch.zeros(4, 2, 3)
+    runner.prefill_diffusion_graph_vars = {
+        "inputs": graph_inputs,
+        "outputs": graph_outputs,
+        "lora_domains": {},
+    }
+
+    class FakeGraph:
+        def __init__(self):
+            self.replayed = False
+
+        def replay(self):
+            self.replayed = True
+            graph_outputs[:4] = graph_inputs["mu"][:4, None, :].expand(-1, 2, -1)
+
+    graph = FakeGraph()
+    runner.prefill_diffusion_graphs = {"base": {4: graph}, "lora": {}}
+    monkeypatch.setattr(runner, "_set_graph_lora_context", lambda *args, **kwargs: None)
+
+    outputs = runner._run_prefill_with_diffusion_graph(
+        inputs={},
+        lora_contexts={DIT_LORA_DOMAIN: LoRAContext(no_lora_flag=True, num_active_loras=0)},
+    )
+
+    assert graph.replayed is True
+    assert outputs["latents"].shape == (3, 2, 3)
+    assert torch.equal(outputs["latents"][:, 0], diffusion_inputs["mu"])
+    assert torch.count_nonzero(graph_inputs["mu"][3]) == 0
+    assert outputs["stop_flag"].tolist() == [0, 1, 0]
+
+
+def test_expand_dit_lora_slots_inserts_padding_inside_each_cfg_branch():
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    slots = expand_dit_lora_slots(
+        sample_to_slot=[3, 7],
+        sequence_length=2,
+        cfg_branches=2,
+        padded_batch_size=4,
+    )
+
+    assert slots == [
+        3,
+        3,
+        7,
+        7,
+        -1,
+        -1,
+        -1,
+        -1,
+        3,
+        3,
+        7,
+        7,
+        -1,
+        -1,
+        -1,
+        -1,
+    ]
+
+
+def test_expand_dit_lora_slots_rejects_smaller_padding_bucket():
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    with pytest.raises(ValueError, match="cannot be smaller"):
+        expand_dit_lora_slots([0, 1], sequence_length=2, cfg_branches=2, padded_batch_size=1)
+
+
+def test_prefill_diffusion_eager_fallback_removes_graph_bucket_lora_padding():
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, expand_dit_lora_slots
+    from nanovllm_voxcpm.utils.context import (
+        DIT_LORA_DOMAIN,
+        build_lora_context_from_token_to_slot,
+        get_lora_context,
+        reset_all_contexts,
+    )
+
+    runner = object.__new__(BaseModelRunner)
+    runner.graph_bs = [1, 2, 4]
+    runner.cfg_branches = 2
+    runner.patch_size = 1
+    runner.dit_lora_seq_len_offset = 0
+    runner.lora_config = SimpleNamespace(enable_dit=True)
+    runner.prefill_diffusion_graphs = {"base": {}, "lora": {}}
+
+    diffusion_inputs = {
+        "mu": torch.zeros(3, 2),
+        "cond": torch.zeros(3, 2, 1),
+        "temperature": torch.ones(3),
+        "cfg_value": torch.ones(3),
+        "z_noise": torch.ones(3, 2, 1),
+    }
+    captured = {}
+
+    class FakeModel:
+        def forward_backbone(self, **inputs):
+            return diffusion_inputs, {"stop_flag": torch.zeros(3, dtype=torch.int64)}
+
+        def forward_diffusion(self, **inputs):
+            captured["token_to_slot"] = get_lora_context(DIT_LORA_DOMAIN).token_to_slot.clone()
+            return torch.zeros(3, 1, 2)
+
+    runner.model = FakeModel()
+    padded_slots = expand_dit_lora_slots(
+        [0, 1, 2],
+        sequence_length=2,
+        cfg_branches=2,
+        padded_batch_size=4,
+    )
+    padded_context = build_lora_context_from_token_to_slot(torch.tensor(padded_slots, dtype=torch.int32))
+
+    try:
+        runner._run_prefill_with_diffusion_graph(
+            inputs={},
+            lora_contexts={DIT_LORA_DOMAIN: padded_context},
+        )
+    finally:
+        reset_all_contexts()
+
+    assert captured["token_to_slot"].tolist() == [0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2]

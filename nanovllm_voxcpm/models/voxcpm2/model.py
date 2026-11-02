@@ -7,6 +7,7 @@ from nanovllm_voxcpm.layers.activation import SiluAndMul
 from nanovllm_voxcpm.layers.attention import Attention
 from nanovllm_voxcpm.layers.embed_head import VocabParallelEmbedding
 from nanovllm_voxcpm.layers.layernorm import RMSNorm
+from nanovllm_voxcpm.layers.longrope import apply_longrope
 from nanovllm_voxcpm.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from nanovllm_voxcpm.layers.lora import (
     LoRALinear,
@@ -84,6 +85,8 @@ class MiniCPMLongRoPE(nn.Module):
     def forward(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query.is_cuda and not torch.is_grad_enabled():
+            return apply_longrope(positions, query, key, self.cos_cached, self.sin_cached, self.dim)
         num_tokens = positions.size(0)
         cos = self.cos_cached[positions]
         sin = self.sin_cached[positions]
@@ -601,7 +604,7 @@ class VoxCPM2Model(nn.Module):
         self.stop_actn = nn.SiLU()
         self.stop_head = nn.Linear(config.lm_config.hidden_size, 2, bias=False)
 
-    def forward(
+    def forward_backbone(
         self,
         positions: torch.Tensor,
         text_tokens: torch.Tensor,
@@ -610,13 +613,21 @@ class VoxCPM2Model(nn.Module):
         temperature: torch.Tensor,
         cfg_value: torch.Tensor,
         z_noise: torch.Tensor | None = None,
+        text_only_prefill: bool = False,
     ):
-        feat_embeds = self.enc_to_lm_proj(self.feat_encoder(feat))
-        feat_embeds = torch.masked_fill(feat_embeds, feat_mask.unsqueeze(-1).logical_not(), 0)
         text_embeds = self.base_lm.embed_tokens(text_tokens)
-        combined_embeds = torch.where(feat_mask.unsqueeze(-1), feat_embeds, text_embeds)
+        if text_only_prefill:
+            # The runner proves the entire mask is false using CPU metadata.
+            # Audio encoding and quantization would both be discarded.
+            feat_embeds = torch.zeros_like(text_embeds)
+            combined_embeds = text_embeds
+        else:
+            feat_embeds = self.enc_to_lm_proj(self.feat_encoder(feat))
+            feat_embeds = torch.masked_fill(feat_embeds, feat_mask.unsqueeze(-1).logical_not(), 0)
+            combined_embeds = torch.where(feat_mask.unsqueeze(-1), feat_embeds, text_embeds)
         enc_outputs = self.base_lm(combined_embeds, positions)
-        enc_outputs = torch.where(feat_mask.unsqueeze(-1), self.fsq_layer(enc_outputs), enc_outputs)
+        if not text_only_prefill:
+            enc_outputs = torch.where(feat_mask.unsqueeze(-1), self.fsq_layer(enc_outputs), enc_outputs)
 
         context = get_context()
         if context.is_prefill:
@@ -638,12 +649,63 @@ class VoxCPM2Model(nn.Module):
             prefix_feat_cond = feat
 
         dit_hidden = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(ralm_hidden)], dim=-1)
-        pred_feat = self.feat_decoder(
-            mu=dit_hidden,
-            cond=prefix_feat_cond.transpose(1, 2).contiguous(),
+        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
+        return (
+            {
+                "mu": dit_hidden,
+                "cond": prefix_feat_cond.transpose(1, 2).contiguous(),
+                "temperature": temperature,
+                "cfg_value": cfg_value,
+                "z_noise": z_noise,
+            },
+            {"stop_flag": stop_flag},
+        )
+
+    def forward_diffusion(
+        self,
+        mu: torch.Tensor,
+        cond: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.feat_decoder(
+            mu=mu,
+            cond=cond,
             temperature=temperature,
             cfg_value=cfg_value,
             z_noise=z_noise,
         ).transpose(1, 2)
-        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
-        return {"latents": pred_feat, "stop_flag": stop_flag}
+
+    def make_dummy_diffusion_inputs(self, batch_size: int) -> dict[str, torch.Tensor]:
+        return {
+            "mu": torch.zeros(batch_size, 2 * self.config.dit_config.hidden_dim),
+            "cond": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+            "temperature": torch.zeros(batch_size),
+            "cfg_value": torch.zeros(batch_size),
+            "z_noise": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+        }
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        text_tokens: torch.Tensor,
+        feat: torch.Tensor,
+        feat_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+        text_only_prefill: bool = False,
+    ):
+        diffusion_inputs, outputs = self.forward_backbone(
+            positions=positions,
+            text_tokens=text_tokens,
+            feat=feat,
+            feat_mask=feat_mask,
+            temperature=temperature,
+            cfg_value=cfg_value,
+            z_noise=z_noise,
+            text_only_prefill=text_only_prefill,
+        )
+        outputs["latents"] = self.forward_diffusion(**diffusion_inputs)
+        return outputs

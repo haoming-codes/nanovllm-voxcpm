@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import torch
@@ -11,6 +12,26 @@ from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint
 from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
 from nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
+
+# A 16-step floor keeps ordinary interjections below the bad-case cutoff (2.56 s).
+_MIN_BADCASE_GENERATED_STEPS = 16
+
+
+def _spoken_target_text(target_text: str) -> str:
+    text = target_text.lstrip()
+    while text.startswith("("):
+        depth = 0
+        for index, character in enumerate(text):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            if depth == 0:
+                text = text[index + 1 :].lstrip()
+                break
+        else:
+            return text
+    return text
 
 
 @dataclass
@@ -70,6 +91,7 @@ class VoxCPM2Engine(LLMEngineBase):
                     seed_step=seq.custom_payload.seed_step,
                 ),
                 adapter_id=seq.adapter_id,
+                seq_id=seq.seq_id,
             )
 
         return RunnerTask(
@@ -88,6 +110,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 seed_step=seq.custom_payload.seed_step,
             ),
             adapter_id=seq.adapter_id,
+            seq_id=seq.seq_id,
         )
 
     def postprocess_seq(self, seq: Sequence[VoxCPM2SeqPayload], outputs: dict, is_prefill: bool):
@@ -119,7 +142,10 @@ class VoxCPM2Engine(LLMEngineBase):
         if reached_model_stop or reached_max_generate_length:
             seq.stoped = True
             seq.custom_payload.is_badcase = len(seq.custom_payload.generated_waveforms) >= (
-                seq.custom_payload.target_text_length * seq.custom_payload.retry_badcase_ratio_threshold
+                max(
+                    _MIN_BADCASE_GENERATED_STEPS,
+                    seq.custom_payload.target_text_length * seq.custom_payload.retry_badcase_ratio_threshold,
+                )
             )
 
     def add_request(
@@ -138,12 +164,14 @@ class VoxCPM2Engine(LLMEngineBase):
     ):
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
-        if retry_badcase_ratio_threshold <= 0:
+        if not math.isfinite(retry_badcase_ratio_threshold) or retry_badcase_ratio_threshold <= 0:
             raise ValueError("retry_badcase_ratio_threshold must be > 0, " f"got {retry_badcase_ratio_threshold}")
 
-        target_text_length = len(self.tokenizer(target_text))
+        # Leading parenthesized instructions condition the voice; they are not spoken.
+        spoken_text = _spoken_target_text(target_text)
+        target_text_length = len(self.tokenizer(spoken_text))
         max_generate_length = min(
-            int(target_text_length * retry_badcase_ratio_threshold + 10),
+            int(max(_MIN_BADCASE_GENERATED_STEPS, target_text_length * retry_badcase_ratio_threshold) + 10),
             max_generate_length,
         )
         text_tokens = self.tokenizer(prompt_text + target_text) + [self.audio_start_token]

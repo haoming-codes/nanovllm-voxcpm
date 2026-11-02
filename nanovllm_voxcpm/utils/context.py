@@ -27,11 +27,21 @@ class LoRAContext:
     slot_start_offsets: torch.Tensor | None = None
     no_lora_flag: bool = True
     num_active_loras: int = 0
+    host_token_to_slot: list[int] | None = None
+    host_token_indices_sorted_by_slot: list[int] | None = None
+    host_active_slot_ids: list[int] | None = None
+    host_num_tokens_per_slot: list[int] | None = None
     # Cached `LoRAMetadata` view of this context. Layers all build an identical
     # metadata object from the same context per step; we materialize it lazily
     # once per context instance and reuse across every LoRA-enabled layer in
     # the model. Cleared by ``set_lora_context`` (i.e. fresh each step).
     _cached_metadata: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def token_count(self) -> int:
+        if self.token_to_slot is not None:
+            return self.token_to_slot.numel()
+        return len(self.host_token_to_slot or ())
 
 
 @dataclass

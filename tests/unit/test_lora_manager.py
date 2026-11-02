@@ -166,3 +166,47 @@ def test_lora_manager_validates_max_lora_rank_on_register():
             manager.register_lora("too-big", oversized_payload)
     finally:
         set_backend_for_testing(None)
+
+
+def test_lora_context_can_defer_device_metadata_for_graph_replay(monkeypatch):
+    import nanovllm_voxcpm.engine.lora_manager as lora_manager
+
+    plan = lora_manager.build_lora_batch_plan_from_token_to_slot(
+        adapter_to_slot={7: 0},
+        token_to_slot=[0, -1, 0],
+    )
+    monkeypatch.setattr(
+        lora_manager,
+        "_pack_int_tensors_to_cuda",
+        lambda *args: (_ for _ in ()).throw(AssertionError("device metadata should be deferred")),
+    )
+
+    context = lora_manager.build_lora_context_from_batch_plan(plan, materialize_device=False)
+
+    assert context.token_to_slot is None
+    assert context.host_token_to_slot == [0, -1, 0]
+    assert context.token_count == 3
+    assert context.no_lora_flag is False
+
+
+def test_materialize_lora_context_builds_deferred_device_metadata(monkeypatch):
+    import nanovllm_voxcpm.engine.lora_manager as lora_manager
+
+    plan = lora_manager.build_lora_batch_plan_from_token_to_slot(
+        adapter_to_slot={7: 0},
+        token_to_slot=[0, -1, 0],
+    )
+    context = lora_manager.build_lora_context_from_batch_plan(plan, materialize_device=False)
+    monkeypatch.setattr(
+        lora_manager,
+        "_pack_int_tensors_to_cuda",
+        lambda *lists: [torch.tensor(values, dtype=torch.int32) for values in lists],
+    )
+
+    materialized = lora_manager.materialize_lora_context(context)
+
+    assert materialized.token_to_slot.tolist() == [0, -1, 0]
+    assert materialized.token_indices_sorted_by_slot.tolist() == [0, 2]
+    assert materialized.active_slot_ids.tolist() == [0]
+    assert materialized.num_tokens_per_slot.tolist() == [2]
+    assert materialized.slot_start_offsets.tolist() == [0, 2]

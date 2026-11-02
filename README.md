@@ -148,11 +148,12 @@ server.stop()
 
 ### Buffered VoxCPM2 generation with bad-case retries
 
-VoxCPM2 applies the OpenBMB text-relative generation limit to both streaming
-and buffered requests:
+VoxCPM2 bounds both streaming and buffered requests relative to target text,
+with a 16-step floor for short interjections:
 
 ```text
-min(max_generate_length, target_text_token_count * retry_badcase_ratio_threshold + 10)
+badcase_steps = max(16, spoken_target_token_count * retry_badcase_ratio_threshold)
+generation_limit = min(max_generate_length, badcase_steps + 10)
 ```
 
 Use `generate_buffered()` when a caller can wait for the complete result and
@@ -175,7 +176,16 @@ wav = np.concatenate(result.waveforms, axis=0)
 print(result.seed, result.attempt_count, result.generated_steps)
 ```
 
-If every attempt exceeds the audio-to-text ratio threshold, the result has no
+An attempt is rejected when its generated step count reaches `badcase_steps`.
+The floor is 2.56 seconds at VoxCPM2's native 160 ms per step; it avoids
+rejecting ordinary short interjections solely because of their token count.
+It remains a length heuristic, not a content or silence detector. The budget
+counts spoken target tokens, excluding leading parenthesized control instructions
+and prompt text. Instructions still reach the model unchanged. User hard limits
+are still respected. Worker crashes propagate as errors and discard partial
+buffered audio; they do not consume retries as if they were bad-case completions.
+
+If every attempt reaches the bad-case threshold, the result has no
 waveforms and `failure_reason="badcase_retry_exhausted"`. The synchronous
 VoxCPM2 server pool exposes the same method without `await`.
 
@@ -250,75 +260,89 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/gpu_smoke.sh --tp
 ### Reference Results (RTX 4090)
 
 All reference numbers in this section are measured on NVIDIA GeForce RTX 4090 with `openbmb/VoxCPM2`.
-The benchmark now defines `RTF_per_req_mean` as the mean over requests of `((request_wall_time - TTFB) / request_audio_duration)` under the given concurrency.
+The benchmark defines `RTF_per_req_mean` as the mean over requests of `((request_wall_time - TTFB) / request_audio_duration)` under the given concurrency.
+
+Unless noted, runs use the default `gpu_memory_utilization=0.8`. Two high-concurrency LoRA
+points (short prompt @ 128, long prompt @ 64) are measured at `gpu_memory_utilization=0.7`
+(marked with `†`); at the default `0.8` they can OOM on a 24 GB card. See "Memory note" below.
+LoRA tables are measured with 5 warmup iterations (instead of 1) to absorb first-touch
+LoRA slot population; with a single warmup iteration the first measured iteration is biased high.
 
 Short prompt, no LoRA:
 
 | concurrency | TTFB p50 (s) | TTFB p90 (s) | RTF_per_req_mean |
 |---:|---:|---:|---:|
-| 1 | 0.1948 ± 0.0008 | 0.1948 ± 0.0008 | 0.0983 ± 0.0027 |
-| 8 | 0.2062 ± 0.0053 | 0.2065 ± 0.0053 | 0.1429 ± 0.0046 |
-| 16 | 0.1959 ± 0.0022 | 0.1963 ± 0.0022 | 0.2221 ± 0.0069 |
-| 32 | 0.2133 ± 0.0011 | 0.2151 ± 0.0010 | 0.3927 ± 0.0108 |
-| 64 | 0.2733 ± 0.0847 | 0.2767 ± 0.0849 | 0.6958 ± 0.0347 |
+| 1 | 0.0362 ± 0.0012 | 0.0362 ± 0.0012 | 0.0859 ± 0.0003 |
+| 8 | 0.0438 ± 0.0025 | 0.0440 ± 0.0026 | 0.1145 ± 0.0007 |
+| 16 | 0.0567 ± 0.0049 | 0.0573 ± 0.0049 | 0.1583 ± 0.0012 |
+| 32 | 0.0765 ± 0.0033 | 0.0771 ± 0.0032 | 0.2516 ± 0.0021 |
+| 64 | 0.1576 ± 0.0189 | 0.1618 ± 0.0214 | 0.5382 ± 0.1000 |
 
 Long prompt, no LoRA:
 
 | concurrency | TTFB p50 (s) | TTFB p90 (s) | RTF_per_req_mean |
 |---:|---:|---:|---:|
-| 1 | 0.2067 ± 0.0036 | 0.2067 ± 0.0036 | 0.1252 ± 0.0005 |
-| 8 | 0.3316 ± 0.0546 | 0.3322 ± 0.0548 | 0.2076 ± 0.0086 |
-| 16 | 0.2449 ± 0.0236 | 0.2456 ± 0.0235 | 0.3223 ± 0.0054 |
-| 32 | 0.3365 ± 0.0116 | 0.3393 ± 0.0118 | 0.5517 ± 0.0075 |
-| 64 | 0.5795 ± 0.0546 | 0.5834 ± 0.0544 | 1.0146 ± 0.0077 |
+| 1 | 0.0433 ± 0.0041 | 0.0433 ± 0.0041 | 0.1016 ± 0.0026 |
+| 8 | 0.0603 ± 0.0099 | 0.0610 ± 0.0098 | 0.1373 ± 0.0067 |
+| 16 | 0.0883 ± 0.0038 | 0.0888 ± 0.0039 | 0.1797 ± 0.0013 |
+| 32 | 0.1898 ± 0.0119 | 0.1909 ± 0.0115 | 0.3061 ± 0.0146 |
+| 64 | 0.3185 ± 0.0028 | 0.3206 ± 0.0027 | 0.5515 ± 0.0040 |
 
 Short prompt, LoRA enabled with 32 runtime slots:
 
 | concurrency | TTFB p50 (s) | TTFB p90 (s) | RTF_per_req_mean |
 |---:|---:|---:|---:|
-| 1 | 0.4568 ± 0.0048 | 0.4568 ± 0.0048 | 0.1495 ± 0.0028 |
-| 8 | 0.6041 ± 0.1172 | 0.6045 ± 0.1172 | 0.2048 ± 0.0039 |
-| 16 | 0.5892 ± 0.1392 | 0.5899 ± 0.1393 | 0.3025 ± 0.0040 |
-| 32 | 0.6446 ± 0.2677 | 0.6460 ± 0.2679 | 0.5300 ± 0.0554 |
-| 64 | 0.4904 ± 0.0579 | 0.4931 ± 0.0575 | 0.8623 ± 0.0131 |
-| 128 | 0.7240 ± 0.2278 | 0.7805 ± 0.1791 | 1.7254 ± 0.0873 |
+| 1 | 0.0876 ± 0.0006 | 0.0876 ± 0.0006 | 0.1133 ± 0.0012 |
+| 8 | 0.0986 ± 0.0201 | 0.0988 ± 0.0202 | 0.1498 ± 0.0019 |
+| 16 | 0.1006 ± 0.0175 | 0.1010 ± 0.0176 | 0.1966 ± 0.0007 |
+| 32 | 0.1125 ± 0.0048 | 0.1133 ± 0.0049 | 0.3065 ± 0.0014 |
+| 64 | 0.1801 ± 0.0032 | 0.1819 ± 0.0029 | 0.5704 ± 0.0118 |
+| 128 † | 0.3691 ± 0.0578 | 0.3735 ± 0.0591 | 1.2174 ± 0.1505 |
 
 Long prompt, LoRA enabled with 32 runtime slots:
 
 | concurrency | TTFB p50 (s) | TTFB p90 (s) | RTF_per_req_mean |
 |---:|---:|---:|---:|
-| 1 | 0.4173 ± 0.0228 | 0.4173 ± 0.0228 | 0.1700 ± 0.0004 |
-| 8 | 0.5660 ± 0.0634 | 0.5663 ± 0.0633 | 0.2280 ± 0.0023 |
-| 16 | 0.6227 ± 0.1158 | 0.6233 ± 0.1156 | 0.3717 ± 0.0027 |
-| 32 | 0.5718 ± 0.1215 | 0.5727 ± 0.1215 | 0.6410 ± 0.0028 |
-| 64 | 0.7754 ± 0.0811 | 0.7785 ± 0.0814 | 1.1209 ± 0.0024 |
+| 1 | 0.0930 ± 0.0047 | 0.0930 ± 0.0047 | 0.1307 ± 0.0005 |
+| 8 | 0.1171 ± 0.0352 | 0.1177 ± 0.0348 | 0.1763 ± 0.0039 |
+| 16 | 0.1177 ± 0.0124 | 0.1192 ± 0.0134 | 0.2455 ± 0.0253 |
+| 32 | 0.1869 ± 0.0140 | 0.1876 ± 0.0139 | 0.3625 ± 0.0049 |
+| 64 † | 0.3913 ± 0.0334 | 0.3922 ± 0.0332 | 0.7433 ± 0.0192 |
+
+`†` measured at `gpu_memory_utilization=0.7`.
 
 Closed-loop results:
 
 | mode | users | registered LoRAs | started | achieved rps | ok | err |
 |---|---:|---:|---:|---:|---:|---:|
-| no LoRA | 60 | 0 | 67 | 1.12 | 67 | 0 |
-| LoRA | 30 | 32 | 57 | 0.95 | 57 | 0 |
-| LoRA | 30 | 128 | 48 | 0.80 | 48 | 0 |
-| LoRA | 30 | 256 | 46 | 0.77 | 46 | 0 |
+| no LoRA | 60 | 0 | 180 | 3.00 | 180 | 0 |
+| LoRA | 30 | 32 | 120 | 2.00 | 120 | 0 |
+| LoRA | 30 | 128 | 120 | 2.00 | 120 | 0 |
+| LoRA | 30 | 256 | 120 | 2.00 | 120 | 0 |
 
 Closed-loop TTFB (seconds, ok requests):
 
 | mode | users | registered LoRAs | p50 | p90 | p95 | p99 | mean | stdev |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| no LoRA | 60 | 0 | 0.3555 | 0.3997 | 0.4019 | 0.4077 | 0.3655 | 0.0365 |
-| LoRA | 30 | 32 | 0.4712 | 0.6390 | 0.7902 | 0.8012 | 0.5071 | 0.1000 |
-| LoRA | 30 | 128 | 0.5337 | 0.8156 | 0.8437 | 0.9264 | 0.5891 | 0.1304 |
-| LoRA | 30 | 256 | 0.5171 | 0.8299 | 0.8380 | 0.8638 | 0.5771 | 0.1218 |
+| no LoRA | 60 | 0 | 0.3379 | 0.3686 | 0.3739 | 0.3745 | 0.3341 | 0.0333 |
+| LoRA | 30 | 32 | 0.1359 | 0.1764 | 0.2912 | 0.6074 | 0.1557 | 0.0833 |
+| LoRA | 30 | 128 | 0.1836 | 0.2793 | 0.3044 | 0.3528 | 0.1969 | 0.0551 |
+| LoRA | 30 | 256 | 0.1944 | 0.2603 | 0.2872 | 0.3198 | 0.2072 | 0.0464 |
 
 Closed-loop RTF ((wall - TTFB)/audio, ok requests):
 
 | mode | users | registered LoRAs | p50 | p90 | p95 | p99 | mean | stdev |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| no LoRA | 60 | 0 | 1.0799 | 1.1648 | 1.1839 | 1.2034 | 1.0028 | 0.2393 |
-| LoRA | 30 | 32 | 0.7718 | 0.8430 | 0.8619 | 0.8661 | 0.7429 | 0.0962 |
-| LoRA | 30 | 128 | 0.8547 | 0.9324 | 0.9682 | 0.9823 | 0.7755 | 0.1612 |
-| LoRA | 30 | 256 | 0.8234 | 0.9047 | 0.9086 | 0.9438 | 0.7332 | 0.1813 |
+| no LoRA | 60 | 0 | 0.5853 | 0.5887 | 0.5887 | 0.5897 | 0.5851 | 0.0028 |
+| LoRA | 30 | 32 | 0.4131 | 0.4269 | 0.4323 | 0.4363 | 0.4119 | 0.0144 |
+| LoRA | 30 | 128 | 0.4279 | 0.4416 | 0.4431 | 0.4466 | 0.4247 | 0.0169 |
+| LoRA | 30 | 256 | 0.4250 | 0.4377 | 0.4416 | 0.4462 | 0.4215 | 0.0166 |
+
+Memory note: this release adds a prefill diffusion CUDA graph that improves latency/throughput
+but increases steady-state VRAM by roughly 2.5 GB (the extra graph pool is not yet accounted for
+in the automatic KV-cache budget). On a 24 GB card at high concurrency with LoRA (e.g. short
+prompt @ 128, long prompt @ 64), the default `gpu_memory_utilization=0.9` can OOM; lower it
+(e.g. `0.7`) or reduce `max_num_seqs` to run those configurations.
 
 ## Acknowledgments
 

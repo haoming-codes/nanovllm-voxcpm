@@ -49,14 +49,14 @@ def test_add_request_requires_positive_max_generate_length():
         e.add_request(seq_id="s", target_text="x", max_generate_length=0)
 
 
-def test_add_request_applies_openbmb_text_relative_limit():
+def test_add_request_applies_short_text_floor_to_text_relative_limit():
     e = _make_engine(max_model_len=64, token_count=2)
     e.add_request(seq_id="s", target_text="x", max_generate_length=2000)
 
     payload = e._captured_seq.custom_payload
     assert payload.target_text_length == 2
     assert payload.retry_badcase_ratio_threshold == 6.0
-    assert payload.max_generate_length == 22
+    assert payload.max_generate_length == 26
 
 
 def test_add_request_excludes_prompt_text_from_text_relative_limit():
@@ -71,7 +71,31 @@ def test_add_request_excludes_prompt_text_from_text_relative_limit():
 
     payload = e._captured_seq.custom_payload
     assert payload.target_text_length == 2
-    assert payload.max_generate_length == 22
+    assert payload.max_generate_length == 26
+
+
+@pytest.mark.parametrize("instruction", ["(Speak Korean) ", " (Speak Korean)(calm) ", "(Speak (native) Korean) "])
+def test_add_request_excludes_control_instructions_only_from_length_budget(instruction):
+    e = _make_engine(max_model_len=64, token_count=2)
+    e.tokenizer = lambda text: [1, 2] if text == "네." else list(range(20))
+    e.add_request(seq_id="s", target_text=instruction + "네.", max_generate_length=2000)
+    payload = e._captured_seq.custom_payload
+    assert payload.target_text_length == 2
+    assert payload.max_generate_length == 26
+    assert payload.text_tokens == list(range(20)) + [101]
+
+
+def test_add_request_keeps_unclosed_parenthesis_in_length_budget():
+    e = _make_engine(max_model_len=256, token_count=20)
+    e.add_request(seq_id="s", target_text="(unclosed instruction hello", max_generate_length=2000)
+    assert e._captured_seq.custom_payload.target_text_length == 20
+    assert e._captured_seq.custom_payload.max_generate_length == 130
+
+
+def test_add_request_keeps_text_relative_limit_for_longer_targets():
+    e = _make_engine(max_model_len=128, token_count=10)
+    e.add_request(seq_id="s", target_text="long target", max_generate_length=2000)
+    assert e._captured_seq.custom_payload.max_generate_length == 70
 
 
 def test_add_request_preserves_lower_requested_limit():
@@ -81,14 +105,15 @@ def test_add_request_preserves_lower_requested_limit():
     assert e._captured_seq.custom_payload.max_generate_length == 7
 
 
-def test_add_request_requires_positive_badcase_ratio():
+@pytest.mark.parametrize("ratio", [0, -1, float("nan"), float("inf")])
+def test_add_request_requires_positive_finite_badcase_ratio(ratio):
     e = _make_engine(max_model_len=16, token_count=2)
     with pytest.raises(ValueError, match=r"retry_badcase_ratio_threshold must be > 0"):
         e.add_request(
             seq_id="s",
             target_text="x",
             max_generate_length=7,
-            retry_badcase_ratio_threshold=0,
+            retry_badcase_ratio_threshold=ratio,
         )
 
 
@@ -149,10 +174,12 @@ def test_postprocess_advances_seed_step_after_generated_latent():
     ("prior_steps", "expected_badcase"),
     [
         (4, False),
-        (11, True),
+        (11, False),
+        (14, False),
+        (15, True),
     ],
 )
-def test_postprocess_uses_openbmb_audio_text_ratio_detector(prior_steps, expected_badcase):
+def test_postprocess_uses_short_text_floor_in_ratio_detector(prior_steps, expected_badcase):
     import numpy as np
 
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine, VoxCPM2SeqPayload
