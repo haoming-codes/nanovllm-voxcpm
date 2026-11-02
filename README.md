@@ -148,11 +148,12 @@ server.stop()
 
 ### Buffered VoxCPM2 generation with bad-case retries
 
-VoxCPM2 applies the OpenBMB text-relative generation limit to both streaming
-and buffered requests:
+VoxCPM2 bounds both streaming and buffered requests relative to target text,
+with a 16-step floor for short interjections:
 
 ```text
-min(max_generate_length, target_text_token_count * retry_badcase_ratio_threshold + 10)
+badcase_steps = max(16, target_text_token_count * retry_badcase_ratio_threshold)
+generation_limit = min(max_generate_length, badcase_steps + 10)
 ```
 
 Use `generate_buffered()` when a caller can wait for the complete result and
@@ -175,7 +176,15 @@ wav = np.concatenate(result.waveforms, axis=0)
 print(result.seed, result.attempt_count, result.generated_steps)
 ```
 
-If every attempt exceeds the audio-to-text ratio threshold, the result has no
+An attempt is rejected when its generated step count reaches `badcase_steps`.
+The floor is 2.56 seconds at VoxCPM2's native 160 ms per step; it avoids
+rejecting ordinary short interjections solely because of their token count.
+It remains a length heuristic, not a content or silence detector. Target
+tokens include control instructions but exclude prompt text. User hard limits
+are still respected. Worker crashes propagate as errors and discard partial
+buffered audio; they do not consume retries as if they were bad-case completions.
+
+If every attempt reaches the bad-case threshold, the result has no
 waveforms and `failure_reason="badcase_retry_exhausted"`. The synchronous
 VoxCPM2 server pool exposes the same method without `await`.
 
